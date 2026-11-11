@@ -1,0 +1,110 @@
+name: File Metadata Writer
+description: Writes Stash scene metadata (tags, Stash IDs, markers as chapters, cover art) into the video files themselves and keeps fingerprints and generated files in sync.
+version: 2.0.0
+url: https://github.com/stashapp/stash
+exec:
+  - python
+  - "{pluginDir}/file_metadata_writer.py"
+interface: raw
+
+settings:
+  writeChanges:
+    displayName: Write changes (leave off for a dry run)
+    description: >-
+      Off = dry run: logs what would change in each file and changes nothing.
+      On = files are rewritten and Stash is updated to match.
+    type: BOOLEAN
+  targetStudio:
+    displayName: Target studio
+    description: Studio name, alias or ID used by the "Studio" task.
+    type: STRING
+  includeSubStudios:
+    displayName: Include sub-studios
+    description: The "Studio" task also processes the target studio's child studios.
+    type: BOOLEAN
+  targetPerformer:
+    displayName: Target performer
+    description: Performer name, alias or ID used by the "Performer" task.
+    type: STRING
+  targetTag:
+    displayName: Target tag
+    description: Tag name, alias or ID used by the "Tag" task.
+    type: STRING
+  includeSubTags:
+    displayName: Include sub-tags
+    description: The "Tag" task also processes scenes with any of the target tag's sub-tags.
+    type: BOOLEAN
+  onlyOrganized:
+    displayName: Only organized scenes
+    description: Skip scenes that aren't marked as organized.
+    type: BOOLEAN
+  excludedTags:
+    displayName: Tags to leave out of the file
+    description: >-
+      Comma-separated tag names or IDs. These tags and all their sub-tags are never
+      written into files (e.g. workflow tags like "Needs review").
+    type: STRING
+  clearStaleTags:
+    displayName: Clear stale metadata
+    description: >-
+      Remove every existing title/tag in the file that doesn't come from Stash
+      (e.g. release-group titles), and remove chapters or cover art when Stash has none.
+    type: BOOLEAN
+  skipChapters:
+    displayName: Don't write chapters
+    description: By default scene markers are written as chapters.
+    type: BOOLEAN
+  skipCover:
+    displayName: Don't embed cover art
+    description: By default the scene cover is embedded (MP4, M4V and MKV).
+    type: BOOLEAN
+  skipStashIds:
+    displayName: Don't write Stash IDs
+    description: By default the Stash scene ID and stash-box (e.g. StashDB) IDs are written.
+    type: BOOLEAN
+  disableMkvpropedit:
+    displayName: Don't use mkvpropedit
+    description: >-
+      If MKVToolNix is installed, MKV/WebM files are edited in place (much faster).
+      Turn on to always rewrite them with ffmpeg instead.
+    type: BOOLEAN
+  keepBackup:
+    displayName: Keep a backup of each original
+    description: >-
+      Keeps the untouched original next to the file as <name>.<ext>.fmwbak, which the
+      "Restore originals" task can put back. Doubles disk use for processed files.
+    type: BOOLEAN
+  skipRescan:
+    displayName: Skip the rescan afterwards
+    description: >-
+      By default a scan of just the changed files is queued when the task ends, so
+      Stash picks up the new file size and modification time. Turn on to skip it.
+    type: BOOLEAN
+  maxFiles:
+    displayName: Maximum files per run (0 = no limit)
+    description: Useful for trying the plugin on a handful of files first.
+    type: NUMBER
+
+tasks:
+  - name: "Write metadata: Studio"
+    description: Write metadata into files of scenes from the studio set in the plugin settings.
+    defaultArgs:
+      mode: studio
+  - name: "Write metadata: Performer"
+    description: Write metadata into files of scenes featuring the performer set in the plugin settings.
+    defaultArgs:
+      mode: performer
+  - name: "Write metadata: Tag"
+    description: Write metadata into files of scenes with the tag set in the plugin settings.
+    defaultArgs:
+      mode: tag
+  - name: "Write metadata: Entire library"
+    description: Write metadata into every scene file in the library. Can take a long time.
+    defaultArgs:
+      mode: all
+  - name: "Restore originals from backups"
+    description: >-
+      Puts back the .fmwbak originals kept by "Keep a backup", and updates Stash's
+      fingerprints and generated files to match. Respects the dry-run setting.
+    defaultArgs:
+      mode: restore
