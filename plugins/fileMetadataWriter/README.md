@@ -63,17 +63,19 @@ and lists the matching IDs. Every task respects the dry-run setting.
 |---|---|---|---|
 | Title | title | title | title |
 | Date | date | date | DATE_RELEASED |
-| Studio | album_artist | album_artist | PUBLISHER |
+| Studio | network (top-level parent studio) | network (top-level parent studio) | PUBLISHER (the scene's own studio) |
+| Sub-studio (if the studio has a parent) | show | show | — |
 | Performers | artist | artist | ARTIST, ACTOR |
-| Tags (minus excluded) | genre | genre | GENRE |
+| Tags (minus excluded) | genre, keywords, and a `tags: …` line at the end of comment | genre, keywords, and a `tags: …` line at the end of comment | GENRE |
 | Details | description, synopsis | description, synopsis | DESCRIPTION |
 | First URL | comment (line 1) | comment | URL |
 | Director | composer | composer | DIRECTOR |
 | Studio code | episode_id | episode_id | CATALOG_NUMBER |
-| First group | album (falls back to studio) | album (falls back to studio) | COLLECTION |
+| First group (series) | grouping | grouping | COLLECTION |
 | Stash scene ID | comment line `stash_scene_id: …` | STASH_SCENE_ID | STASH_SCENE_ID |
 | StashDB scene ID | comment line `stashdb_id: …` | STASHDB_ID | STASHDB_ID |
 | All stash-box IDs | comment lines `stashbox_id: <endpoint> <id>` | STASHBOX_IDS | STASHBOX_IDS |
+| Media type | Movie (`media_type` 9) | Movie (`media_type` 9) | — |
 | Markers | chapters | chapters | chapters |
 | Cover | embedded cover art | — | `cover.jpg`/`cover.png` attachment |
 
@@ -95,6 +97,12 @@ Notes:
   which every reader supports.
 - **Stash scene IDs** are local to your database. The StashDB ID is the one that
   stays meaningful forever.
+- **Network and show:** for a sub-studio, the top-level studio of its chain is the
+  network and the scene's own studio is the show. For a top-level studio, only
+  network is set.
+- **Upgrading from v2.0:** the `album` and `album_artist` values that v2.0 wrote
+  are removed the next time a file is processed. Values that didn't come from
+  the plugin are left alone.
 - Multiple values are joined with `; `. Without **Clear stale metadata**, a field
   that's empty in Stash leaves whatever the file already had.
 - Files that already match are skipped, so re-running a task only touches scenes

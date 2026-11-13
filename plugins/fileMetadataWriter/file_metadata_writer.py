@@ -187,35 +187,36 @@ CONTAINERS = {
 # Container-level keys that describe the file itself, never removed by "clear stale".
 TECH_KEYS = {"major_brand", "minor_version", "compatible_brands", "encoder", "creation_time"}
 
+# Keys written by plugin v2.0 that the current layout no longer uses. They are
+# removed when they still hold the value the plugin put there.
+RETIRED_KEYS = {"mp4": ("album", "album_artist"), "mov": ("album", "album_artist")}
+
 ID_FIELDS = {"stash_scene_id", "stashdb_id", "stashbox_ids"}
+
+# MP4 and MOV share one layout. Studio goes to network; a sub-studio's top-level
+# parent is the network and the sub-studio itself is the show. media_type 9 is
+# iTunes' "Movie". Tags are copied into keywords and onto the end of the comment.
+_QT_COMMON = {
+    "title": ["title"],
+    "date": ["date"],
+    "network": ["network"],
+    "show": ["show"],
+    "performers": ["artist"],
+    "tags": ["genre", "keywords"],
+    "details": ["description", "synopsis"],
+    "director": ["composer"],
+    "code": ["episode_id"],
+    "group": ["grouping"],
+}
 
 TAG_MAP = {
     # MP4/M4V: standard iTunes-style atoms read by Plex, Jellyfin, Windows, macOS,
-    # VLC, MediaInfo and exiftool. MP4 can't hold custom keys, so the URL and
-    # Stash IDs go into the comment as "key: value" lines (built in desired_tags).
-    "mp4": {
-        "title": ["title"],
-        "date": ["date"],
-        "studio": ["album_artist"],
-        "performers": ["artist"],
-        "tags": ["genre"],
-        "details": ["description", "synopsis"],
-        "director": ["composer"],
-        "code": ["episode_id"],
-        "group": ["album"],
-    },
+    # VLC, MediaInfo and exiftool. MP4 can't hold custom keys, so the URL, Stash
+    # IDs and a copy of the tags go into the comment (built in desired_tags).
+    "mp4": dict(_QT_COMMON),
     # MOV: QuickTime key/value metadata, which also allows custom keys.
     "mov": {
-        "title": ["title"],
-        "date": ["date"],
-        "studio": ["album_artist"],
-        "performers": ["artist"],
-        "tags": ["genre"],
-        "details": ["description", "synopsis"],
-        "url": ["comment"],
-        "director": ["composer"],
-        "code": ["episode_id"],
-        "group": ["album"],
+        **_QT_COMMON,
         "stash_scene_id": ["STASH_SCENE_ID"],
         "stashdb_id": ["STASHDB_ID"],
         "stashbox_ids": ["STASHBOX_IDS"],
@@ -259,10 +260,14 @@ def scene_fields(scene, excluded_tag_ids):
         (s.get("endpoint") or "", s["stash_id"]) for s in scene.get("stash_ids") or [] if s.get("stash_id")
     ]
     stashdb = next((sid for ep, sid in stash_ids if "stashdb.org" in ep), None)
+    studio = clean((scene.get("studio") or {}).get("name"))
+    top = clean(scene.get("_top_studio")) or studio
     return {
         "title": clean(scene.get("title")),
         "date": clean(scene.get("date")),
-        "studio": clean((scene.get("studio") or {}).get("name")),
+        "studio": studio,
+        "network": top,
+        "show": studio if studio and top != studio else None,
         "performers": clean("; ".join(performers)),
         "tags": clean("; ".join(tags)),
         "details": clean(scene.get("details")),
@@ -287,18 +292,29 @@ def desired_tags(fields, family, include_ids):
             continue
         for key in keys:
             out[key] = value
-    if family == "mp4":
+    if family in ("mp4", "mov"):
+        out["media_type"] = "9"  # Movie
+    if family in ("mp4", "mov"):
         lines = [fields["url"]] if fields.get("url") else []
-        if include_ids:
+        if include_ids and family == "mp4":
             lines.append(f"stash_scene_id: {fields['stash_scene_id']}")
             if fields.get("stashdb_id"):
                 lines.append(f"stashdb_id: {fields['stashdb_id']}")
             lines += [f"stashbox_id: {ep} {sid}" for ep, sid in fields["_stash_ids"]]
+        if fields.get("tags"):
+            lines.append(f"tags: {fields['tags']}")
         if lines:
             out["comment"] = "\n".join(lines)
-    if family in ("mp4", "mov") and "album" not in out and fields.get("studio"):
-        out["album"] = fields["studio"]
     return out
+
+
+def retired_tags(info_tags, fields, family):
+    """Existing keys left behind by plugin v2.0 that should now be removed."""
+    old_values = {normalise(v) for v in (fields.get("studio"), fields.get("group"), fields.get("network")) if v}
+    return [
+        k for k, v in info_tags.items()
+        if k.lower() in RETIRED_KEYS.get(family, ()) and normalise(v) in old_values
+    ]
 
 
 def normalise(value):
@@ -526,6 +542,8 @@ def remux(ffmpeg, src, dst, container, info, plan, clear_stale, workdir):
         for k in info.tags:
             if k.lower() in ours and k != ours[k.lower()]:
                 meta += ["-metadata", f"{k}="]
+        for k in plan.stale:
+            meta += ["-metadata", f"{k}="]
     for key, value in plan.tags.items():
         meta += ["-metadata", f"{key}={value}"]
 
@@ -597,7 +615,7 @@ def edit_mkv_in_place(mkvpropedit, path, info, plan, clear_stale, workdir):
     elif clear_stale and current_title:
         cmd += ["--edit", "info", "--delete", "title"]
 
-    ours = {k.lower() for k in plan.tags}
+    ours = {k.lower() for k in plan.tags} | {k.lower() for k in plan.stale}
     final = {} if clear_stale else {
         k: v for k, v in info.tags.items() if k.lower() not in ours and k.lower() != "title"
     }
@@ -642,6 +660,9 @@ def verify_output(ffprobe, ffmpeg, before, out_path, plan, family):
     a, b = before.duration, after.duration
     if a is not None and b is not None and abs(a - b) > 1.0:
         raise RuntimeError(f"duration changed ({a:.2f}s -> {b:.2f}s)")
+    leftover = [k for k in plan.stale if k in after.tags]
+    if leftover:
+        raise RuntimeError(f"tags not removed: {', '.join(leftover)}")
     missing = tag_diff(after.tags, plan.tags)
     if missing:
         raise RuntimeError(f"tags did not stick: {', '.join(missing)}")
@@ -723,7 +744,7 @@ class GeneratedIndex:
 
 SCENE_FIELDS = """
   id title code details director date organized urls
-  studio { name }
+  studio { id name parent_studio { id } }
   performers { name }
   tags { id name }
   groups { group { name } }
@@ -896,6 +917,7 @@ class Run:
         self.excluded_tags = set()
         self.missing_cover = set()
         self.cover_cache = {}
+        self.studio_cache = {}
         self.changed_paths = []
         self.stats = {
             "written": 0, "would_write": 0, "restored": 0, "would_restore": 0, "up_to_date": 0,
@@ -922,6 +944,27 @@ class Run:
             self.missing_cover = {str(s["id"]) for s in res["findScenes"]["scenes"]}
         except GraphQLError as e:
             log_debug(f"Couldn't list scenes without covers ({e}); will check each one")
+
+    def top_studio(self, studio):
+        """Name of the top-level parent of a studio (the studio itself if it has none)."""
+        if not studio:
+            return None
+        seen = set()
+        current = {"id": str(studio.get("id")), "name": studio.get("name"),
+                   "parent": (studio.get("parent_studio") or {}).get("id")}
+        while current["parent"] and current["parent"] not in seen:
+            seen.add(current["id"])
+            pid = str(current["parent"])
+            if pid not in self.studio_cache:
+                found = self.stash.call(
+                    "query($id: ID!) { findStudio(id: $id) { id name parent_studio { id } } }", {"id": pid}
+                )["findStudio"]
+                if not found:
+                    break
+                self.studio_cache[pid] = {"id": pid, "name": found["name"],
+                                          "parent": (found.get("parent_studio") or {}).get("id")}
+            current = self.studio_cache[pid]
+        return current["name"]
 
     def cover_for(self, scene_id):
         """The scene cover as (bytes, ext, mime), or None if the scene has none."""
@@ -993,12 +1036,15 @@ class Run:
     def plan_for(self, scene, container, info):
         family = container["family"]
         plan = Plan()
+        scene["_top_studio"] = self.top_studio(scene.get("studio"))
         fields = scene_fields(scene, self.excluded_tags)
         plan.tags = desired_tags(fields, family, self.with_ids)
         plan.tag_changes = tag_diff(info.tags, plan.tags)
         if self.clear_stale:
             ours = {k.lower() for k in plan.tags}
             plan.stale = [k for k in info.tags if k.lower() not in ours and k.lower() not in TECH_KEYS]
+        else:
+            plan.stale = retired_tags(info.tags, fields, family)
 
         if self.with_chapters:
             markers = scene.get("scene_markers") or []
