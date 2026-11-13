@@ -222,17 +222,22 @@ TAG_MAP = {
         "stashbox_ids": ["STASHBOX_IDS"],
     },
     # Matroska/WebM: official Matroska tag names plus custom keys for the IDs.
+    # Without MKVToolNix (ffmpeg) every tag is a single value at the movie level, so
+    # the series goes into a custom COLLECTION tag and performers are joined. With
+    # mkvpropedit the richer layout from desired_mkv_rich() is used instead.
     "mkv": {
         "title": ["title"],
         "date": ["DATE_RELEASED"],
-        "studio": ["PUBLISHER"],
+        "network": ["PUBLISHER"],
+        "show": ["PRODUCTION_STUDIO"],
         "performers": ["ARTIST", "ACTOR"],
-        "tags": ["GENRE"],
+        "tags": ["GENRE", "KEYWORDS"],
         "details": ["DESCRIPTION"],
         "url": ["URL"],
         "director": ["DIRECTOR"],
         "code": ["CATALOG_NUMBER"],
         "group": ["COLLECTION"],
+        "rating": ["RATING"],
         "stash_scene_id": ["STASH_SCENE_ID"],
         "stashdb_id": ["STASHDB_ID"],
         "stashbox_ids": ["STASHBOX_IDS"],
@@ -262,6 +267,9 @@ def scene_fields(scene, excluded_tag_ids):
     stashdb = next((sid for ep, sid in stash_ids if "stashdb.org" in ep), None)
     studio = clean((scene.get("studio") or {}).get("name"))
     top = clean(scene.get("_top_studio")) or studio
+    rating = None
+    if scene.get("rating100") is not None:
+        rating = f"{scene['rating100'] / 20:.2f}".rstrip("0").rstrip(".")  # Stash 0-100 -> Matroska 0-5
     return {
         "title": clean(scene.get("title")),
         "date": clean(scene.get("date")),
@@ -278,7 +286,9 @@ def scene_fields(scene, excluded_tag_ids):
         "stash_scene_id": str(scene["id"]),
         "stashdb_id": stashdb,
         "stashbox_ids": clean("; ".join(f"{ep} {sid}" for ep, sid in stash_ids)),
+        "rating": rating,
         "_stash_ids": stash_ids,
+        "_performers": performers,
     }
 
 
@@ -294,18 +304,33 @@ def desired_tags(fields, family, include_ids):
             out[key] = value
     if family in ("mp4", "mov"):
         out["media_type"] = "9"  # Movie
-    if family in ("mp4", "mov"):
-        lines = [fields["url"]] if fields.get("url") else []
-        if include_ids and family == "mp4":
-            lines.append(f"stash_scene_id: {fields['stash_scene_id']}")
-            if fields.get("stashdb_id"):
-                lines.append(f"stashdb_id: {fields['stashdb_id']}")
-            lines += [f"stashbox_id: {ep} {sid}" for ep, sid in fields["_stash_ids"]]
-        if fields.get("tags"):
-            lines.append(f"tags: {fields['tags']}")
-        if lines:
-            out["comment"] = "\n".join(lines)
+    if family == "mkv":
+        out["CONTENT_TYPE"] = "Movie"
+    comment_key = "COMMENT" if family == "mkv" else "comment"
+    lines = [fields["url"]] if fields.get("url") else []
+    if include_ids and family in ("mp4", "mkv"):
+        lines.append(f"stash_scene_id: {fields['stash_scene_id']}")
+        if fields.get("stashdb_id"):
+            lines.append(f"stashdb_id: {fields['stashdb_id']}")
+        lines += [f"stashbox_id: {ep} {sid}" for ep, sid in fields["_stash_ids"]]
+    if fields.get("tags"):
+        lines.append(f"tags: {fields['tags']}")
+    if lines:
+        out[comment_key] = "\n".join(lines)
     return out
+
+
+def desired_mkv_rich(fields, flat):
+    """Matroska layout for mkvpropedit: segment title + (level, NAME, value) entries.
+
+    Level 50 is the movie itself, level 70 the collection it belongs to. Each
+    performer gets its own ACTOR entry and the series is the collection's TITLE.
+    """
+    entries = [(50, k, v) for k, v in flat.items() if k not in ("title", "COLLECTION", "ACTOR")]
+    entries += [(50, "ACTOR", p) for p in fields["_performers"]]
+    if fields.get("group"):
+        entries.append((70, "TITLE", fields["group"]))
+    return flat.get("title"), entries
 
 
 def retired_tags(info_tags, fields, family):
@@ -395,15 +420,201 @@ def write_mkv_chapters_xml(path, chapters):
                 f"<Chapters><EditionEntry>{atoms}</EditionEntry></Chapters>\n")
 
 
+_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def xml_text(v):
+    return xml_escape(_XML_BAD.sub("", str(v)))
+
+
 def write_mkv_tags_xml(path, tags):
-    simples = "".join(
-        f"<Simple><Name>{xml_escape(k)}</Name><String>{xml_escape(v)}</String></Simple>"
-        for k, v in tags.items()
-    )
+    """Flat dict -> one movie-level Tag (used when the file's tags can't be read exactly)."""
+    tag = {"level": 50, "type": None, "uids": {},
+           "simple": [{"name": k, "value": v} for k, v in tags.items()]}
+    write_mkv_tag_list_xml(path, [tag])
+
+
+def _simple_xml(sim):
+    x = f"<Simple><Name>{xml_text(sim['name'])}</Name>"
+    if sim.get("binary") is not None:
+        x += f'<Binary format="hex">{sim["binary"].hex()}</Binary>'
+    elif sim.get("value") is not None:
+        x += f"<String>{xml_text(sim['value'])}</String>"
+    if sim.get("lang") and sim["lang"] != "und":
+        x += f"<TagLanguage>{xml_text(sim['lang'])}</TagLanguage>"
+    if sim.get("lang_ietf"):
+        x += f"<TagLanguageIETF>{xml_text(sim['lang_ietf'])}</TagLanguageIETF>"
+    if sim.get("default") is False:
+        x += "<DefaultLanguage>0</DefaultLanguage>"
+    x += "".join(_simple_xml(c) for c in sim.get("children") or [])
+    return x + "</Simple>"
+
+
+def write_mkv_tag_list_xml(path, tags):
+    """List of tag dicts (as returned by read_mkv_meta) -> mkvpropedit tags XML."""
+    parts = []
+    for t in tags:
+        targets = f"<TargetTypeValue>{int(t['level'])}</TargetTypeValue>"
+        if t.get("type"):
+            targets += f"<TargetType>{xml_text(t['type'])}</TargetType>"
+        for kind, el in (("edition", "EditionUID"), ("chapter", "ChapterUID"), ("attachment", "AttachmentUID")):
+            for uid in (t.get("uids") or {}).get(kind, []):
+                targets += f"<{el}>{int(uid)}</{el}>"
+        parts.append(f"<Tag><Targets>{targets}</Targets>" + "".join(_simple_xml(x) for x in t["simple"]) + "</Tag>")
     with open(path, "w", encoding="utf-8") as f:
-        f.write('<?xml version="1.0" encoding="UTF-8"?>\n'
-                "<Tags><Tag><Targets><TargetTypeValue>50</TargetTypeValue></Targets>"
-                f"{simples}</Tag></Tags>\n")
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n<Tags>' + "".join(parts) + "</Tags>\n")
+
+
+# --------------------------------------------------------------------------- #
+# Matroska reader: segment title and tags exactly as stored (ffprobe flattens
+# repeated tags and drops target levels, so it can't be used to compare them)
+# --------------------------------------------------------------------------- #
+
+_EBML_HEADER, _SEGMENT, _INFO, _TITLE = 0x1A45DFA3, 0x18538067, 0x1549A966, 0x7BA9
+_TAGS, _TAG, _TARGETS, _SIMPLE = 0x1254C367, 0x7373, 0x63C0, 0x67C8
+_TARGET_LEVEL, _TARGET_TYPE = 0x68CA, 0x63CA
+_UID_KINDS = {0x63C5: "track", 0x63C9: "edition", 0x63C4: "chapter", 0x63C6: "attachment"}
+_TAG_NAME, _TAG_STRING, _TAG_BINARY = 0x45A3, 0x4487, 0x4485
+_TAG_LANG, _TAG_LANG_IETF, _TAG_DEFAULT = 0x447A, 0x447B, 0x4484
+
+
+def _vint(f, keep_marker):
+    b = f.read(1)
+    if not b:
+        return None, 0
+    first, n, mask = b[0], 1, 0x80
+    while n <= 8 and not first & mask:
+        mask >>= 1
+        n += 1
+    if n > 8:
+        raise ValueError("bad EBML number")
+    val = first if keep_marker else first & (mask - 1)
+    for x in f.read(n - 1):
+        val = (val << 8) | x
+    return val, n
+
+
+def _children(f, start, end):
+    pos = start
+    while pos < end:
+        f.seek(pos)
+        eid, n = _vint(f, True)
+        if eid is None:
+            return
+        size, m = _vint(f, False)
+        data = pos + n + m
+        unknown = size == (1 << (7 * m)) - 1
+        yield eid, (None if unknown else size), data
+        if unknown:
+            return
+        pos = data + size
+
+
+def _uint(f, pos, size):
+    f.seek(pos)
+    return int.from_bytes(f.read(size), "big") if size else 0
+
+
+def _text(f, pos, size):
+    f.seek(pos)
+    return f.read(size).rstrip(b"\0").decode("utf-8", "replace")
+
+
+def _read_simple(f, start, end):
+    sim = {"name": "", "value": None, "lang": "und", "children": []}
+    for eid, size, pos in _children(f, start, end):
+        if size is None:
+            break
+        if eid == _TAG_NAME:
+            sim["name"] = _text(f, pos, size)
+        elif eid == _TAG_STRING:
+            sim["value"] = _text(f, pos, size)
+        elif eid == _TAG_BINARY:
+            f.seek(pos)
+            sim["binary"] = f.read(size)
+        elif eid == _TAG_LANG:
+            sim["lang"] = _text(f, pos, size)
+        elif eid == _TAG_LANG_IETF:
+            sim["lang_ietf"] = _text(f, pos, size)
+        elif eid == _TAG_DEFAULT:
+            sim["default"] = bool(_uint(f, pos, size))
+        elif eid == _SIMPLE:
+            sim["children"].append(_read_simple(f, pos, pos + size))
+    return sim
+
+
+def _read_tag(f, start, end):
+    tag = {"level": 50, "type": None, "uids": {}, "simple": []}
+    for eid, size, pos in _children(f, start, end):
+        if size is None:
+            break
+        if eid == _TARGETS:
+            for tid, tsize, tpos in _children(f, pos, pos + size):
+                if tsize is None:
+                    break
+                if tid == _TARGET_LEVEL:
+                    tag["level"] = _uint(f, tpos, tsize)
+                elif tid == _TARGET_TYPE:
+                    tag["type"] = _text(f, tpos, tsize)
+                elif tid in _UID_KINDS:
+                    uid = _uint(f, tpos, tsize)
+                    if uid:
+                        tag["uids"].setdefault(_UID_KINDS[tid], []).append(uid)
+        elif eid == _SIMPLE:
+            tag["simple"].append(_read_simple(f, pos, pos + size))
+    return tag
+
+
+def read_mkv_meta(path):
+    """{"title": str|None, "tags": [tag dicts]} or None if the file can't be walked."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            top = list(_children(f, 0, min(size, 1 << 20)))[:2]
+            if len(top) < 2 or top[0][0] != _EBML_HEADER or top[1][0] != _SEGMENT:
+                return None
+            _, seg_size, seg_start = top[1]
+            seg_end = size if seg_size is None else min(size, seg_start + seg_size)
+            meta = {"title": None, "tags": []}
+            for eid, esize, pos in _children(f, seg_start, seg_end):
+                if esize is None:
+                    return None  # unknown-size element (live recording): can't skip past it
+                if eid == _INFO:
+                    for iid, isize, ipos in _children(f, pos, pos + esize):
+                        if iid == _TITLE and isize is not None:
+                            meta["title"] = _text(f, ipos, isize)
+                elif eid == _TAGS:
+                    for tid, tsize, tpos in _children(f, pos, pos + esize):
+                        if tid == _TAG and tsize is not None:
+                            meta["tags"].append(_read_tag(f, tpos, tpos + tsize))
+            return meta
+    except (OSError, ValueError):
+        return None
+
+
+def is_global(tag):
+    return not tag.get("uids")
+
+
+def global_entries(tags):
+    """(level, NAME, value) for every top-level string tag that isn't bound to a track etc."""
+    return [
+        (t["level"], sim["name"].upper(), sim["value"])
+        for t in tags if is_global(t)
+        for sim in t["simple"] if sim.get("value") is not None and sim["name"]
+    ]
+
+
+def group_entries(entries):
+    out = {}
+    for level, name, value in entries:
+        out.setdefault((level, name.upper()), []).append(value)
+    return out
+
+
+def entry_label(key):
+    level, name = key
+    return name if level == 50 else f"{name} (collection level)" if level == 70 else f"{name} (level {level})"
 
 
 # --------------------------------------------------------------------------- #
@@ -487,6 +698,7 @@ class Plan:
         self.stale = []         # existing keys to drop (clear stale)
         self.chapters = None    # None = leave alone, [] = remove, [..] = write
         self.cover = None       # None = leave alone, ("set", bytes, ext, mime) or ("remove",)
+        self.rich = None        # MKV via mkvpropedit: {"title", "delete_title", "entries", "stale", "keep"}
 
     @property
     def empty(self):
@@ -610,22 +822,39 @@ def edit_mkv_in_place(mkvpropedit, path, info, plan, clear_stale, workdir):
     """Apply the plan to an MKV/WebM file in place with mkvpropedit."""
     cmd = [mkvpropedit, path]
     current_title = next((k for k in info.tags if k.lower() == "title"), None)
-    if "title" in plan.tags:
+    if plan.rich:
+        r = plan.rich
+        if r["title"]:
+            cmd += ["--edit", "info", "--set", f"title={r['title']}"]
+        elif r["delete_title"]:
+            cmd += ["--edit", "info", "--delete", "title"]
+        tags = list(r["keep"])
+        for level in sorted({lvl for lvl, _, _ in r["entries"]}):
+            tags.append({"level": level, "type": None, "uids": {}, "simple": [
+                {"name": n, "value": v} for lvl, n, v in r["entries"] if lvl == level]})
+        if tags:
+            tags_xml = os.path.join(workdir, "tags.xml")
+            write_mkv_tag_list_xml(tags_xml, tags)
+            cmd += ["--tags", f"global:{tags_xml}"]
+        else:
+            cmd += ["--tags", "global:"]
+    elif "title" in plan.tags:
         cmd += ["--edit", "info", "--set", f"title={plan.tags['title']}"]
     elif clear_stale and current_title:
         cmd += ["--edit", "info", "--delete", "title"]
 
-    ours = {k.lower() for k in plan.tags} | {k.lower() for k in plan.stale}
-    final = {} if clear_stale else {
-        k: v for k, v in info.tags.items() if k.lower() not in ours and k.lower() != "title"
-    }
-    final.update({k: v for k, v in plan.tags.items() if k != "title"})
-    if final:
-        tags_xml = os.path.join(workdir, "tags.xml")
-        write_mkv_tags_xml(tags_xml, final)
-        cmd += ["--tags", f"global:{tags_xml}"]
-    else:
-        cmd += ["--tags", "global:"]
+    if not plan.rich:
+        ours = {k.lower() for k in plan.tags} | {k.lower() for k in plan.stale}
+        final = {} if clear_stale else {
+            k: v for k, v in info.tags.items() if k.lower() not in ours and k.lower() != "title"
+        }
+        final.update({k: v for k, v in plan.tags.items() if k != "title"})
+        if final:
+            tags_xml = os.path.join(workdir, "tags.xml")
+            write_mkv_tags_xml(tags_xml, final)
+            cmd += ["--tags", f"global:{tags_xml}"]
+        else:
+            cmd += ["--tags", "global:"]
 
     if plan.chapters:
         chap_xml = os.path.join(workdir, "chapters.xml")
@@ -650,6 +879,25 @@ def edit_mkv_in_place(mkvpropedit, path, info, plan, clear_stale, workdir):
         raise RuntimeError(f"mkvpropedit failed: {(res.stdout + res.stderr).strip()[:500]}")
 
 
+def verify_rich(path, rich):
+    meta = read_mkv_meta(path)
+    if meta is None:
+        raise RuntimeError("couldn't read the file's tags back")
+    if rich["title"] and normalise(meta["title"]) != normalise(rich["title"]):
+        raise RuntimeError("title did not stick")
+    if rich["delete_title"] and meta["title"]:
+        raise RuntimeError("title was not removed")
+    have = group_entries(global_entries(meta["tags"]))
+    want = group_entries(rich["entries"])
+    wrong = [entry_label(k) for k, v in want.items()
+             if sorted(map(normalise, have.get(k, []))) != sorted(map(normalise, v))]
+    if wrong:
+        raise RuntimeError(f"tags did not stick: {', '.join(wrong)}")
+    leftover = [entry_label(k) for k in rich["stale"] if k in have]
+    if leftover:
+        raise RuntimeError(f"tags not removed: {', '.join(leftover)}")
+
+
 def verify_output(ffprobe, ffmpeg, before, out_path, plan, family):
     after = probe(ffprobe, out_path, family)
     for kind in ("video", "audio"):
@@ -660,12 +908,15 @@ def verify_output(ffprobe, ffmpeg, before, out_path, plan, family):
     a, b = before.duration, after.duration
     if a is not None and b is not None and abs(a - b) > 1.0:
         raise RuntimeError(f"duration changed ({a:.2f}s -> {b:.2f}s)")
-    leftover = [k for k in plan.stale if k in after.tags]
-    if leftover:
-        raise RuntimeError(f"tags not removed: {', '.join(leftover)}")
-    missing = tag_diff(after.tags, plan.tags)
-    if missing:
-        raise RuntimeError(f"tags did not stick: {', '.join(missing)}")
+    if plan.rich:
+        verify_rich(out_path, plan.rich)
+    else:
+        leftover = [k for k in plan.stale if k in after.tags]
+        if leftover:
+            raise RuntimeError(f"tags not removed: {', '.join(leftover)}")
+        missing = tag_diff(after.tags, plan.tags)
+        if missing:
+            raise RuntimeError(f"tags did not stick: {', '.join(missing)}")
     if plan.chapters is not None and after.chapters != chapter_key(plan.chapters):
         raise RuntimeError("chapters did not come out as expected")
     if plan.cover and plan.cover[0] == "set":
@@ -743,7 +994,7 @@ class GeneratedIndex:
 # --------------------------------------------------------------------------- #
 
 SCENE_FIELDS = """
-  id title code details director date organized urls
+  id title code details director date organized urls rating100
   studio { id name parent_studio { id } }
   performers { name }
   tags { id name }
@@ -1033,12 +1284,62 @@ class Run:
 
     # ------------------------------------------------------------ write mode
 
-    def plan_for(self, scene, container, info):
+    def plan_for(self, scene, container, info, allow_rich=True):
         family = container["family"]
         plan = Plan()
         scene["_top_studio"] = self.top_studio(scene.get("studio"))
         fields = scene_fields(scene, self.excluded_tags)
         plan.tags = desired_tags(fields, family, self.with_ids)
+        meta = read_mkv_meta(info.path) if (allow_rich and family == "mkv" and self.mkvpropedit) else None
+        if meta is not None:
+            self.plan_rich(plan, fields, meta)
+        else:
+            self.plan_flat(plan, fields, family, info)
+        self.plan_media(plan, scene, container, info)
+        return plan
+
+    def plan_rich(self, plan, fields, meta):
+        title, entries = desired_mkv_rich(fields, plan.tags)
+        plan.tags = {}
+        managed = {(lvl, n.upper()) for lvl, n, _ in entries}
+        have = group_entries(global_entries(meta["tags"]))
+        want = group_entries(entries)
+        if title and normalise(meta["title"]) != normalise(title):
+            plan.tag_changes["title"] = (meta["title"], title)
+        for key, values in want.items():
+            if sorted(map(normalise, have.get(key, []))) != sorted(map(normalise, values)):
+                old = " | ".join(have.get(key, [])) or None
+                plan.tag_changes[entry_label(key)] = (old, " | ".join(values))
+        delete_title = False
+        if self.clear_stale:
+            stale = {k for k in have if k not in managed and k[1].lower() not in TECH_KEYS}
+            delete_title = bool(not title and meta["title"])
+            dropped = [t for t in meta["tags"] if not is_global(t) and "track" not in t["uids"]]
+        else:
+            # COLLECTION was written by plugin v2.0; the series now lives at the collection level
+            stale = {k for k, v in have.items()
+                     if k == (50, "COLLECTION") and fields.get("group")
+                     and all(normalise(x) == normalise(fields["group"]) for x in v)}
+            dropped = []
+        keep = []
+        for t in meta["tags"]:
+            if "track" in t["uids"]:
+                continue  # track tags aren't global; mkvpropedit leaves them alone
+            if not is_global(t):
+                if t not in dropped:
+                    keep.append(t)
+                continue
+            simple = [x for x in t["simple"]
+                      if (t["level"], x["name"].upper()) not in managed | stale
+                      and not (self.clear_stale and x["name"].lower() not in TECH_KEYS)]
+            if simple:
+                keep.append({**t, "simple": simple})
+        plan.stale = [entry_label(k) for k in sorted(stale)] + (["title"] if delete_title else []) \
+            + ([f"{len(dropped)} targeted tag block(s)"] if dropped else [])
+        plan.rich = {"title": title, "delete_title": delete_title, "entries": entries,
+                     "stale": sorted(stale), "keep": keep}
+
+    def plan_flat(self, plan, fields, family, info):
         plan.tag_changes = tag_diff(info.tags, plan.tags)
         if self.clear_stale:
             ours = {k.lower() for k in plan.tags}
@@ -1046,6 +1347,7 @@ class Run:
         else:
             plan.stale = retired_tags(info.tags, fields, family)
 
+    def plan_media(self, plan, scene, container, info):
         if self.with_chapters:
             markers = scene.get("scene_markers") or []
             if markers:
@@ -1064,7 +1366,6 @@ class Run:
                     plan.cover = ("set",) + want
             elif self.clear_stale and have:
                 plan.cover = ("remove",)
-        return plan
 
     def process_file(self, scene, f):
         path = f["path"]
@@ -1112,6 +1413,12 @@ class Run:
                 done = self.write_in_place(scene, f, path, container, info, plan, old_fp, workdir)
                 if done:
                     return
+                if plan.rich:
+                    plan = self.plan_for(scene, container, info, allow_rich=False)
+                    if plan.empty:
+                        self.stats["up_to_date"] += 1
+                        log_info(f"Nothing to change in the ffmpeg layout: {path}")
+                        return
             self.write_remux(scene, f, path, container, info, plan, old_fp, workdir)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)

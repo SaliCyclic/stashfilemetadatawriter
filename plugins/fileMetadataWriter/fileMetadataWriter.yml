@@ -1,6 +1,6 @@
 name: File Metadata Writer
 description: Writes Stash scene metadata (tags, Stash IDs, markers as chapters, cover art) into the video files themselves and keeps fingerprints and generated files in sync.
-version: 2.1.0
+version: 2.2.0
 url: https://github.com/stashapp/stash
 exec:
   - python

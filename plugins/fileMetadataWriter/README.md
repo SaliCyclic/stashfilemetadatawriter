@@ -61,23 +61,32 @@ and lists the matching IDs. Every task respects the dry-run setting.
 
 | Stash data | MP4 / M4V | MOV | MKV / WebM |
 |---|---|---|---|
-| Title | title | title | title |
+| Title | title | title | segment title |
 | Date | date | date | DATE_RELEASED |
-| Studio | network (top-level parent studio) | network (top-level parent studio) | PUBLISHER (the scene's own studio) |
-| Sub-studio (if the studio has a parent) | show | show | — |
-| Performers | artist | artist | ARTIST, ACTOR |
-| Tags (minus excluded) | genre, keywords, and a `tags: …` line at the end of comment | genre, keywords, and a `tags: …` line at the end of comment | GENRE |
+| Studio | network (top-level parent studio) | network (top-level parent studio) | PUBLISHER (top-level parent studio) |
+| Sub-studio (if the studio has a parent) | show | show | PRODUCTION_STUDIO |
+| Performers | artist | artist | ARTIST (joined), plus one ACTOR per performer* |
+| Tags (minus excluded) | genre, keywords, `tags: …` line at end of comment | genre, keywords, `tags: …` line at end of comment | GENRE, KEYWORDS, `tags: …` line at end of COMMENT |
 | Details | description, synopsis | description, synopsis | DESCRIPTION |
-| First URL | comment (line 1) | comment | URL |
+| First URL | comment (line 1) | comment (line 1) | URL, and COMMENT (line 1) |
 | Director | composer | composer | DIRECTOR |
 | Studio code | episode_id | episode_id | CATALOG_NUMBER |
-| First group (series) | grouping | grouping | COLLECTION |
-| Stash scene ID | comment line `stash_scene_id: …` | STASH_SCENE_ID | STASH_SCENE_ID |
-| StashDB scene ID | comment line `stashdb_id: …` | STASHDB_ID | STASHDB_ID |
-| All stash-box IDs | comment lines `stashbox_id: <endpoint> <id>` | STASHBOX_IDS | STASHBOX_IDS |
-| Media type | Movie (`media_type` 9) | Movie (`media_type` 9) | — |
+| First group (series) | grouping | grouping | TITLE at the collection level* |
+| Rating | — | — | RATING (Stash's 0–100 converted to 0–5) |
+| Stash scene ID | comment line `stash_scene_id: …` | STASH_SCENE_ID | STASH_SCENE_ID, and a COMMENT line |
+| StashDB scene ID | comment line `stashdb_id: …` | STASHDB_ID | STASHDB_ID, and a COMMENT line |
+| All stash-box IDs | comment lines `stashbox_id: <endpoint> <id>` | STASHBOX_IDS | STASHBOX_IDS, and COMMENT lines |
+| Media type | Movie (`media_type` 9) | Movie (`media_type` 9) | CONTENT_TYPE = Movie |
 | Markers | chapters | chapters | chapters |
 | Cover | embedded cover art | — | `cover.jpg`/`cover.png` attachment |
+
+\* **Needs MKVToolNix.** Matroska can hold repeated tags and tags that describe
+the collection a file belongs to, but only `mkvpropedit` can write them. Without
+it, the plugin writes a single joined `ACTOR` and a custom `COLLECTION` tag
+instead. If you install MKVToolNix later, the next run converts those files to
+the richer layout and removes the old `COLLECTION` tag. In-place edits keep any
+existing MKV tags the plugin doesn't manage (unless **Clear stale metadata** is
+on), including repeated, nested and track-specific tags.
 
 Notes:
 
